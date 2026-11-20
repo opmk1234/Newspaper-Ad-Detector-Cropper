@@ -98,11 +98,11 @@ def snap_box_to_ad_boundary(
     gray: np.ndarray,
     paper_bgr: np.ndarray,
     box: tuple[int, int, int, int],
-    expand_pct: float = 0.01,
-    max_scan_ratio: float = 0.025,
-    safety_pad_px: int = 4,
+    expand_pct: float = 0.0,
+    max_scan_ratio: float = 0.02,
+    safety_pad_px: int = 2,
 ) -> tuple[int, int, int, int]:
-    """Expand a YOLO box slightly and snap to the nearest outer ad border rule."""
+    """Snap a YOLO box to the nearest outer ad border rule without crossing into editorial text."""
     h, w = gray.shape
     x1, y1, x2, y2 = box
     bw, bh = x2 - x1, y2 - y1
@@ -136,7 +136,7 @@ def snap_box_to_ad_boundary(
 
     rx1, ry1 = bx1 - sx1, by1 - sy1
     rx2, ry2 = bx2 - sx1, by2 - sy1
-    gutter_stop_px = max(6, int(0.006 * min(w, h)))
+    gutter_stop_px = max(4, int(0.004 * min(w, h)))
 
     def scan_side(strip_ink: np.ndarray, strip_fg: np.ndarray, reverse: bool) -> int:
         length = strip_ink.shape[0]
@@ -209,7 +209,7 @@ class YOLOAdDetector:
 
         work_gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
         paper_bgr = estimate_paper_color(work_bgr)
-        scaled_pad = max(1, int(round(4 * snap_scale)))
+        scaled_pad = max(1, int(round(2 * snap_scale)))
 
         raw_boxes = res.boxes.xyxy.cpu().numpy()
         confs = res.boxes.conf.cpu().numpy()
@@ -241,7 +241,7 @@ class YOLOAdDetector:
                 gray=work_gray,
                 paper_bgr=paper_bgr,
                 box=(wx1, wy1, wx2, wy2),
-                expand_pct=0.01,
+                expand_pct=0.0,
                 safety_pad_px=scaled_pad,
             )
 
