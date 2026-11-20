@@ -2,8 +2,8 @@
 
 An end-to-end computer vision web application that automatically detects, refines, and extracts display advertisements from full-resolution newspaper pages. Built with a fine-tuned **YOLO11s** detector and a multi-stage OpenCV post-processing pipeline, deployed on **Streamlit Community Cloud**.
 
-- **Live App:** https://newspaper-ad-detector-cropper-8holoaild2o7tqzwgxkdel.streamlit.app/
-- **Repository:** https://github.com/opmk1234/Newspaper-Ad-Detector-Cropper
+- **Live App:** [https://newspaper-ad-detector-cropper-8holoaild2o7tqzwgxkdel.streamlit.app/](https://newspaper-ad-detector-cropper-8holoaild2o7tqzwgxkdel.streamlit.app/)
+- **Repository:** [https://github.com/opmk1234/Newspaper-Ad-Detector-Cropper](https://github.com/opmk1234/Newspaper-Ad-Detector-Cropper)
 
 ---
 
@@ -47,3 +47,20 @@ Trained on custom-annotated newspaper pages using **YOLO11s** (`imgsz=1024`). Th
 ├── LICENSE              # MIT License
 └── README.md
 ```
+
+---
+
+## Run Locally
+
+```bash
+git clone https://github.com/opmk1234/Newspaper-Ad-Detector-Cropper.git
+cd Newspaper-Ad-Detector-Cropper
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+---
+
+## Known Limitations
+
+- **Script & Layout Domain Shift:** The detector was trained primarily on English/Latin-script broadsheets. Regional newspapers with dense non-Latin typography (such as Devanagari mastheads or shaded editorial callout boxes) may produce false positives unless fine-tuned on domain-specific examples.
