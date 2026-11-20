@@ -178,6 +178,31 @@ def snap_box_to_ad_boundary(
     return (fx1, fy1, fx2, fy2) if (fx2 > fx1 and fy2 > fy1) else (bx1, by1, bx2, by2)
 
 
+def trim_overshot_top_edge(img_bgr: np.ndarray, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Trim top editorial bleed when YOLO's raw box overshoots across a clean white separator gutter."""
+    x1, y1, x2, y2 = box
+    crop = img_bgr[y1:y2, x1:x2]
+    bh, bw = crop.shape[:2]
+    if bh < 40 or bw < 40:
+        return box
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    row_fg = (gray < 240).mean(axis=1)
+    max_trim = int(0.08 * bh)
+
+    blank_indices = np.where(row_fg[:max_trim] < 0.03)[0]
+    if len(blank_indices) >= 3:
+        last_blank = int(blank_indices[-1])
+        if last_blank + 3 < bh and row_fg[last_blank + 1 : last_blank + 4].mean() > 0.35:
+            above = row_fg[:last_blank]
+            has_editorial_text = np.any((above > 0.05) & (above < 0.75))
+            all_blank_above = np.all(above < 0.03) if len(above) > 0 else True
+            if all_blank_above or has_editorial_text:
+                return (x1, y1 + last_blank + 1, x2, y2)
+
+    return box
+
+
 class YOLOAdDetector:
     def __init__(self, weights_path: str = "models/best.pt", conf: float = 0.60, imgsz: int = 1024):
         self.model = YOLO(weights_path)
@@ -249,6 +274,8 @@ class YOLOAdDetector:
             fy1 = max(0, int(round(sy1 / snap_scale)))
             fx2 = min(w, int(round(sx2 / snap_scale)))
             fy2 = min(h, int(round(sy2 / snap_scale)))
+
+            fx1, fy1, fx2, fy2 = trim_overshot_top_edge(image_bgr, (fx1, fy1, fx2, fy2))
 
             detections.append({
                 "bbox": (fx1, fy1, fx2, fy2),
