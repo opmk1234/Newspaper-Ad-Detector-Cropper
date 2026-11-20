@@ -1,0 +1,6 @@
+source_page,crop_file,confidence,x1,y1,x2,y2,width,height
+9gva_20240909_8_jpg.rf.b0592a08e4c638e737dfff50f7e7fc01.jpg,9gva_20240909_8_jpg.rf.b0592a08e4c638e737dfff50f7e7fc01_ad_01.png,0.9558,19,324,359,1008,340,684
+9gva_20240909_9_jpg.rf.ac79b32e48a5bd4e480a223c1235e036.jpg,9gva_20240909_9_jpg.rf.ac79b32e48a5bd4e480a223c1235e036_ad_01.png,0.8471,0,40,491,1002,491,962
+9gva_20240909_9_jpg.rf.f61d157f916511b170811e06dfa43798.jpg,9gva_20240909_9_jpg.rf.f61d157f916511b170811e06dfa43798_ad_01.png,0.6457,19,35,527,994,508,959
+BMW_newspaper_page (1).png,BMW_newspaper_page (1)_ad_01.png,0.7967,0,0,425,84,425,84
+BMW_newspaper_page (1).png,BMW_newspaper_page (1)_ad_02.png,0.8507,0,399,510,799,510,400
