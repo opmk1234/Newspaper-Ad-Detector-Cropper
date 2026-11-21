@@ -44,7 +44,6 @@ def trim_mirror_padding(img_bgr: np.ndarray, mae_thresh: float = 9.5) -> np.ndar
         if span < min_span:
             continue
         reflected = gray[:, s - span : s][:, ::-1]
-        # Skip blank white newspaper margins
         if np.std(reflected) < 12.0:
             continue
         diff_101 = np.mean(np.abs(reflected - gray[:, s + 1 : s + 1 + span]))
@@ -93,34 +92,24 @@ def estimate_paper_color(img_bgr: np.ndarray) -> np.ndarray:
     return np.median(border_pixels, axis=0).astype(np.float32)
 
 
-def snap_box_to_ad_boundary(
-    img_bgr: np.ndarray,
-    gray: np.ndarray,
+def snap_outward_to_border(
+    work_bgr: np.ndarray,
+    work_gray: np.ndarray,
     paper_bgr: np.ndarray,
     box: tuple[int, int, int, int],
-    expand_pct: float = 0.0,
     max_scan_ratio: float = 0.02,
-    safety_pad_px: int = 2,
 ) -> tuple[int, int, int, int]:
-    """Snap a YOLO box to the nearest outer ad border rule without crossing into editorial text."""
-    h, w = gray.shape
-    x1, y1, x2, y2 = box
-    bw, bh = x2 - x1, y2 - y1
+    """Expand a slightly tight YOLO box outward to the nearest enclosing border rule (0 px extra padding)."""
+    h, w = work_gray.shape
+    bx1, by1, bx2, by2 = box
 
-    grow_x = int(round(bw * expand_pct))
-    grow_y = int(round(bh * expand_pct))
-    bx1 = max(0, x1 - grow_x)
-    by1 = max(0, y1 - grow_y)
-    bx2 = min(w, x2 + grow_x)
-    by2 = min(h, y2 + grow_y)
-
-    scan_x = max(10, int(w * max_scan_ratio))
-    scan_y = max(10, int(h * max_scan_ratio))
+    scan_x = max(8, int(w * max_scan_ratio))
+    scan_y = max(8, int(h * max_scan_ratio))
     sx1, sy1 = max(0, bx1 - scan_x), max(0, by1 - scan_y)
     sx2, sy2 = min(w, bx2 + scan_x), min(h, by2 + scan_y)
 
-    roi_gray = gray[sy1:sy2, sx1:sx2]
-    roi_bgr = img_bgr[sy1:sy2, sx1:sx2].astype(np.float32)
+    roi_gray = work_gray[sy1:sy2, sx1:sx2]
+    roi_bgr = work_bgr[sy1:sy2, sx1:sx2].astype(np.float32)
     if roi_gray.size == 0:
         return bx1, by1, bx2, by2
 
@@ -170,37 +159,79 @@ def snap_box_to_ad_boundary(
     top_ext = scan_side(ink_mask[:ry1, rx1:rx2], fg_mask[:ry1, rx1:rx2], reverse=True)
     bottom_ext = scan_side(ink_mask[ry2:, rx1:rx2], fg_mask[ry2:, rx1:rx2], reverse=False)
 
-    fx1 = max(0, bx1 - left_ext - safety_pad_px)
-    fy1 = max(0, by1 - top_ext - safety_pad_px)
-    fx2 = min(w, bx2 + right_ext + safety_pad_px)
-    fy2 = min(h, by2 + bottom_ext + safety_pad_px)
+    fx1 = max(0, bx1 - left_ext)
+    fy1 = max(0, by1 - top_ext)
+    fx2 = min(w, bx2 + right_ext)
+    fy2 = min(h, by2 + bottom_ext)
 
     return (fx1, fy1, fx2, fy2) if (fx2 > fx1 and fy2 > fy1) else (bx1, by1, bx2, by2)
 
 
-def trim_overshot_top_edge(img_bgr: np.ndarray, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
-    """Trim top editorial bleed when YOLO's raw box overshoots across a clean white separator gutter."""
-    x1, y1, x2, y2 = box
-    crop = img_bgr[y1:y2, x1:x2]
-    bh, bw = crop.shape[:2]
-    if bh < 40 or bw < 40:
+def trim_exact_ad_edges(
+    img_bgr: np.ndarray,
+    paper_bgr: np.ndarray,
+    box: tuple[int, int, int, int],
+) -> tuple[int, int, int, int]:
+    """
+    Trim any overshot editorial text across a clean white separator gutter and strip
+    outer blank newsprint margins on all 4 sides so zero extra padding remains.
+    """
+    fx1, fy1, fx2, fy2 = box
+    crop_bgr = img_bgr[fy1:fy2, fx1:fx2].astype(np.float32)
+    bh, bw = crop_bgr.shape[:2]
+    if bh < 30 or bw < 30:
         return box
 
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    row_fg = (gray < 240).mean(axis=1)
-    max_trim = int(0.08 * bh)
-
-    blank_indices = np.where(row_fg[:max_trim] < 0.03)[0]
-    if len(blank_indices) >= 3:
-        last_blank = int(blank_indices[-1])
-        if last_blank + 3 < bh and row_fg[last_blank + 1 : last_blank + 4].mean() > 0.35:
+    # 1. Trim overshot top editorial text across a white separator gutter (within top 10%)
+    fg = np.linalg.norm(crop_bgr - paper_bgr, axis=2) > 18.0
+    row_fg = fg.mean(axis=1)
+    max_trim_y = int(0.10 * bh)
+    blank_top = np.where(row_fg[:max_trim_y] < 0.02)[0]
+    if len(blank_top) >= 3:
+        last_blank = int(blank_top[-1])
+        if last_blank + 3 < bh and row_fg[last_blank + 1 : last_blank + 4].mean() > 0.30:
             above = row_fg[:last_blank]
-            has_editorial_text = np.any((above > 0.05) & (above < 0.75))
-            all_blank_above = np.all(above < 0.03) if len(above) > 0 else True
-            if all_blank_above or has_editorial_text:
-                return (x1, y1 + last_blank + 1, x2, y2)
+            has_editorial = np.any((above > 0.04) & (above < 0.78))
+            all_blank = np.all(above < 0.02) if len(above) > 0 else True
+            if all_blank or has_editorial:
+                fy1 += last_blank + 1
 
-    return box
+    # 2. Trim overshot bottom editorial text across a white separator gutter (within bottom 10%)
+    crop_bgr = img_bgr[fy1:fy2, fx1:fx2].astype(np.float32)
+    bh, bw = crop_bgr.shape[:2]
+    fg = np.linalg.norm(crop_bgr - paper_bgr, axis=2) > 18.0
+    row_fg = fg.mean(axis=1)
+    max_trim_y = int(0.10 * bh)
+    blank_bot = np.where(row_fg[bh - max_trim_y :] < 0.02)[0]
+    if len(blank_bot) >= 3:
+        first_blank = (bh - max_trim_y) + int(blank_bot[0])
+        if first_blank - 3 >= 0 and row_fg[first_blank - 3 : first_blank].mean() > 0.30:
+            below = row_fg[first_blank + 1 :]
+            has_editorial = np.any((below > 0.04) & (below < 0.78))
+            all_blank = np.all(below < 0.02) if len(below) > 0 else True
+            if all_blank or has_editorial:
+                fy2 = fy1 + first_blank
+
+    # 3. Strip outer blank paper rows/columns on all 4 edges (0 px extra padding)
+    crop_bgr = img_bgr[fy1:fy2, fx1:fx2].astype(np.float32)
+    fg = np.linalg.norm(crop_bgr - paper_bgr, axis=2) > 18.0
+    row_fg = fg.mean(axis=1)
+    col_fg = fg.mean(axis=0)
+
+    while fy1 < fy2 - 20 and row_fg[0] < 0.015:
+        fy1 += 1
+        row_fg = row_fg[1:]
+    while fy2 > fy1 + 20 and row_fg[-1] < 0.015:
+        fy2 -= 1
+        row_fg = row_fg[:-1]
+    while fx1 < fx2 - 20 and col_fg[0] < 0.015:
+        fx1 += 1
+        col_fg = col_fg[1:]
+    while fx2 > fx1 + 20 and col_fg[-1] < 0.015:
+        fx2 -= 1
+        col_fg = col_fg[:-1]
+
+    return (fx1, fy1, fx2, fy2) if (fx2 > fx1 and fy2 > fy1) else box
 
 
 class YOLOAdDetector:
@@ -233,8 +264,8 @@ class YOLOAdDetector:
             work_bgr = image_bgr
 
         work_gray = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2GRAY)
-        paper_bgr = estimate_paper_color(work_bgr)
-        scaled_pad = max(1, int(round(2 * snap_scale)))
+        paper_work = estimate_paper_color(work_bgr)
+        paper_full = estimate_paper_color(image_bgr)
 
         raw_boxes = res.boxes.xyxy.cpu().numpy()
         confs = res.boxes.conf.cpu().numpy()
@@ -261,13 +292,11 @@ class YOLOAdDetector:
             wx2 = int(round(x2 * snap_scale))
             wy2 = int(round(y2 * snap_scale))
 
-            sx1, sy1, sx2, sy2 = snap_box_to_ad_boundary(
-                img_bgr=work_bgr,
-                gray=work_gray,
-                paper_bgr=paper_bgr,
+            sx1, sy1, sx2, sy2 = snap_outward_to_border(
+                work_bgr=work_bgr,
+                work_gray=work_gray,
+                paper_bgr=paper_work,
                 box=(wx1, wy1, wx2, wy2),
-                expand_pct=0.0,
-                safety_pad_px=scaled_pad,
             )
 
             fx1 = max(0, int(round(sx1 / snap_scale)))
@@ -275,7 +304,7 @@ class YOLOAdDetector:
             fx2 = min(w, int(round(sx2 / snap_scale)))
             fy2 = min(h, int(round(sy2 / snap_scale)))
 
-            fx1, fy1, fx2, fy2 = trim_overshot_top_edge(image_bgr, (fx1, fy1, fx2, fy2))
+            fx1, fy1, fx2, fy2 = trim_exact_ad_edges(image_bgr, paper_full, (fx1, fy1, fx2, fy2))
 
             detections.append({
                 "bbox": (fx1, fy1, fx2, fy2),
