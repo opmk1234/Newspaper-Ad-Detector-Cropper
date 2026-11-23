@@ -1,4 +1,5 @@
 import csv
+import gc
 import io
 import itertools
 import zipfile
@@ -332,6 +333,17 @@ def is_uniform_solid_ad_block(
         return False
 
     roi_bgr = work_bgr[cy : cy + ch, cx : cx + cw]
+    # Downsample large candidate blocks before float32 texture checks to save RAM
+    max_roi_dim = max(cw, ch)
+    if max_roi_dim > 360:
+        s = 360.0 / max_roi_dim
+        roi_bgr = cv2.resize(
+            roi_bgr,
+            (max(1, int(round(cw * s))), max(1, int(round(ch * s)))),
+            interpolation=cv2.INTER_AREA,
+        )
+
+    rh, rw = roi_bgr.shape[:2]
     roi_f = roi_bgr.astype(np.float32)
     blur_f = cv2.blur(roi_f, (3, 3))
     local_diff = np.linalg.norm(roi_f - blur_f, axis=2)
@@ -342,7 +354,7 @@ def is_uniform_solid_ad_block(
     # Smooth tinted pixels exclude high-texture photographic foliage/faces/rubble
     smooth_tinted = (local_diff <= 6.0) & (roi_hsv[:, :, 1] >= 15) & (color_dist >= 16.0)
     smooth_pixels = roi_bgr[smooth_tinted]
-    if smooth_pixels.shape[0] < int(0.36 * cw * ch):
+    if smooth_pixels.shape[0] < int(0.36 * rw * rh):
         return False
 
     # Check that smooth pixels belong to one dominant background fill/gradient
@@ -498,7 +510,7 @@ class YOLOAdDetector:
         return merged
 
 
-def build_preview_jpeg(img_bgr: np.ndarray, detections: list[dict], max_dim: int = 1400) -> bytes:
+def build_preview_jpeg(img_bgr: np.ndarray, detections: list[dict], max_dim: int = 1200) -> bytes:
     """Create a lightweight JPEG preview of the page with green bounding boxes."""
     h, w = img_bgr.shape[:2]
     scale = min(1.0, max_dim / max(h, w))
@@ -525,7 +537,7 @@ def build_preview_jpeg(img_bgr: np.ndarray, detections: list[dict], max_dim: int
             2,
         )
 
-    _, buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    _, buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 82])
     return buf.tobytes()
 
 
@@ -581,6 +593,7 @@ def run_extraction_pipeline(
 
             arr = np.frombuffer(img_bytes, dtype=np.uint8)
             img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            del arr
             if img_bgr is None:
                 continue
 
@@ -597,18 +610,18 @@ def run_extraction_pipeline(
                 total_ads += 1
 
                 crop_bgr = img_bgr[y1:y2, x1:x2]
-                ok, png_buf = cv2.imencode(".png", crop_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+                ok, png_buf = cv2.imencode(".png", crop_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 6])
                 if ok:
                     crop_filename = f"{stem}_ad_{ad_idx:02d}.png"
                     zip_member_path = f"{stem}/{crop_filename}" if organize_by_folder else crop_filename
-                    png_bytes = png_buf.tobytes()
-                    master_zip.writestr(zip_member_path, png_bytes)
+                    master_zip.writestr(zip_member_path, png_buf.tobytes())
 
+                    # Store zip_path instead of duplicating PNG bytes in session_state
                     page_crops.append({
                         "id": ad_idx,
                         "confidence": conf,
                         "filename": crop_filename,
-                        "png_bytes": png_bytes,
+                        "zip_path": zip_member_path,
                         "bbox": (x1, y1, x2, y2),
                     })
                     manifest_rows.append([
@@ -622,6 +635,7 @@ def run_extraction_pipeline(
                         x2 - x1,
                         y2 - y1,
                     ])
+                del crop_bgr, png_buf
 
             pages_data.append({
                 "display_name": display_name,
@@ -629,6 +643,9 @@ def run_extraction_pipeline(
                 "preview_bytes": build_preview_jpeg(img_bgr, detections),
                 "crops": page_crops,
             })
+
+            del img_bgr
+            gc.collect()
 
         csv_buf = io.StringIO()
         writer = csv.writer(csv_buf)
@@ -732,6 +749,8 @@ if submit_single and single_file is not None:
     else:
         with st.spinner(f"Detecting ads on {single_file.name}..."):
             res = run_extraction_pipeline(items, detector, organize_by_folder=False, show_progress=False)
+        del items
+        gc.collect()
         res["mode"] = "single"
         st.session_state["last_run"] = res
 
@@ -746,6 +765,8 @@ if submit_bulk and bulk_files:
             organize_by_folder=organize_by_folder,
             show_progress=True,
         )
+        del items
+        gc.collect()
         res["mode"] = "bulk"
         st.session_state["last_run"] = res
 
@@ -827,18 +848,20 @@ with col_crops:
     if not active_page["crops"]:
         st.info("No ads detected on this page.")
     else:
-        for crop in active_page["crops"]:
-            w_px = crop["bbox"][2] - crop["bbox"][0]
-            h_px = crop["bbox"][3] - crop["bbox"][1]
-            st.image(
-                crop["png_bytes"],
-                caption=f"Ad #{crop['id']} — conf {crop['confidence']:.2f} ({w_px}×{h_px} px)",
-                use_container_width=True,
-            )
-            st.download_button(
-                label=f"Download {crop['filename']}",
-                data=crop["png_bytes"],
-                file_name=crop["filename"],
-                mime="image/png",
-                key=f"dl_{results['mode']}_{active_page['stem']}_{crop['id']}",
-            )
+        with zipfile.ZipFile(io.BytesIO(results["zip_bytes"]), "r") as zf:
+            for crop in active_page["crops"]:
+                crop_png = zf.read(crop["zip_path"])
+                w_px = crop["bbox"][2] - crop["bbox"][0]
+                h_px = crop["bbox"][3] - crop["bbox"][1]
+                st.image(
+                    crop_png,
+                    caption=f"Ad #{crop['id']} — conf {crop['confidence']:.2f} ({w_px}×{h_px} px)",
+                    use_container_width=True,
+                )
+                st.download_button(
+                    label=f"Download {crop['filename']}",
+                    data=crop_png,
+                    file_name=crop["filename"],
+                    mime="image/png",
+                    key=f"dl_{results['mode']}_{active_page['stem']}_{crop['id']}",
+                )
