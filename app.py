@@ -288,7 +288,6 @@ def extend_to_footer_rule(
         return box
 
     first_rule = rule_rows[0]
-    # Include the full thickness (1-3 px) of that rule, then stop immediately
     rule_end = first_rule
     while rule_end + 1 in rule_rows and (rule_end - first_rule) < 4:
         rule_end += 1
@@ -307,21 +306,77 @@ def extend_to_footer_rule(
     return box
 
 
+def is_uniform_solid_ad_block(
+    work_bgr: np.ndarray,
+    paper_bgr: np.ndarray,
+    cx: int,
+    cy: int,
+    cw: int,
+    ch: int,
+    area: int,
+) -> bool:
+    """
+    Verify that a colored connected component has a smooth, uniform solid/gradient
+    background color (like the pastel sky-blue USHA fan ad) rather than textured
+    news photographs or wide editorial callout strips.
+    """
+    sh, sw = work_bgr.shape[:2]
+    if cw < int(0.065 * sw) or ch < int(0.042 * sh) or cw > int(0.95 * sw) or ch > int(0.85 * sh):
+        return False
+
+    aspect = cw / float(max(1, ch))
+    if aspect < 0.45 or aspect > 2.15:
+        return False
+
+    if (area / float(max(1, cw * ch))) < 0.74:
+        return False
+
+    roi_bgr = work_bgr[cy : cy + ch, cx : cx + cw]
+    roi_f = roi_bgr.astype(np.float32)
+    blur_f = cv2.blur(roi_f, (3, 3))
+    local_diff = np.linalg.norm(roi_f - blur_f, axis=2)
+
+    roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
+    color_dist = np.linalg.norm(roi_f - paper_bgr, axis=2)
+
+    # Smooth tinted pixels exclude high-texture photographic foliage/faces/rubble
+    smooth_tinted = (local_diff <= 6.0) & (roi_hsv[:, :, 1] >= 15) & (color_dist >= 16.0)
+    smooth_pixels = roi_bgr[smooth_tinted]
+    if smooth_pixels.shape[0] < int(0.36 * cw * ch):
+        return False
+
+    # Check that smooth pixels belong to one dominant background fill/gradient
+    quant = (smooth_pixels // 20).astype(np.int32)
+    keys = quant[:, 0] * 169 + quant[:, 1] * 13 + quant[:, 2]
+    vals, counts = np.unique(keys, return_counts=True)
+    top_key = vals[int(np.argmax(counts))]
+    mode_bgr = np.median(smooth_pixels[keys == top_key], axis=0).astype(np.float32)
+
+    consistent_ratio = float((smooth_tinted & (np.linalg.norm(roi_f - mode_bgr, axis=2) <= 34.0)).mean())
+    return consistent_ratio >= 0.34
+
+
 class YOLOAdDetector:
-    def __init__(self, weights_path: str = "models/best.pt", conf: float = 0.50, imgsz: int = 1024):
+    def __init__(
+        self,
+        weights_path: str = "models/best.pt",
+        conf: float = 0.70,
+        imgsz: int = 1024,
+        recover_solid_ads: bool = True,
+    ):
         self.model = YOLO(weights_path)
         self.conf = conf
         self.imgsz = imgsz
+        self.recover_solid_ads = recover_solid_ads
 
     def detect(self, image_bgr: np.ndarray) -> list[dict]:
         h, w = image_bgr.shape[:2]
 
-        # Single forward pass down to floor=0.15 (zero extra PyTorch RAM)
-        floor_conf = min(0.15, self.conf)
+        # Strictly respect the user's confidence slider for all YOLO detections
         res = self.model.predict(
             source=image_bgr,
             imgsz=self.imgsz,
-            conf=floor_conf,
+            conf=self.conf,
             iou=0.45,
             agnostic_nms=True,
             verbose=False,
@@ -364,49 +419,34 @@ class YOLOAdDetector:
                 if touches_lr_edge and bw < int(0.24 * w) and (bh / max(1, bw)) > 3.5:
                     continue
 
-                if conf >= self.conf:
-                    candidates.append((x1, y1, x2, y2, conf))
-                else:
-                    # Rescue lower-confidence boxes only if they sit on a tinted/colored ad block
-                    if bw < int(0.06 * w) or bh < int(0.03 * h):
-                        continue
-                    if y1 < int(0.08 * h) and (bw / max(1, bh)) > 3.2:
-                        continue
-                    crop_bgr = image_bgr[y1:y2, x1:x2]
-                    tinted_ratio = float(
-                        (np.linalg.norm(crop_bgr.astype(np.float32) - paper_full, axis=2) > 16.0).mean()
-                    )
-                    mean_sat = float(cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
-                    if tinted_ratio >= 0.35 and mean_sat >= 18.0:
-                        candidates.append((x1, y1, x2, y2, conf))
+                candidates.append((x1, y1, x2, y2, conf))
 
-        # Pastel/colored rectangular display-ad recovery (catches solid-tint sidebar ads like USHA)
-        color_dist = np.linalg.norm(work_bgr.astype(np.float32) - paper_work, axis=2)
-        sat = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
-        color_mask = ((color_dist > 16.0) & (sat > 16)).astype(np.uint8) * 255
-        color_mask = cv2.morphologyEx(
-            color_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-        )
-        num_lbls, _, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+        # Smooth solid/pastel display-ad recovery (catches compact banners like USHA without triggering on photos)
+        if self.recover_solid_ads:
+            color_dist = np.linalg.norm(work_bgr.astype(np.float32) - paper_work, axis=2)
+            sat = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
+            color_mask = ((color_dist > 16.0) & (sat > 15)).astype(np.uint8) * 255
+            color_mask = cv2.morphologyEx(
+                color_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+            )
+            num_lbls, _, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
 
-        for lbl in range(1, num_lbls):
-            cx, cy, cw, ch, area = stats[lbl]
-            if cw < int(0.08 * sw) or ch < int(0.035 * sh) or cw > int(0.95 * sw) or ch > int(0.85 * sh):
-                continue
-            if (area / float(max(1, cw * ch))) < 0.74:
-                continue
+            for lbl in range(1, num_lbls):
+                cx, cy, cw, ch, area = map(int, stats[lbl])
+                if not is_uniform_solid_ad_block(work_bgr, paper_work, cx, cy, cw, ch, area):
+                    continue
 
-            rx1 = max(0, int(round(cx / snap_scale)))
-            ry1 = max(0, int(round(cy / snap_scale)))
-            rx2 = min(w, int(round((cx + cw) / snap_scale)))
-            ry2 = min(h, int(round((cy + ch) / snap_scale)))
+                rx1 = max(0, int(round(cx / snap_scale)))
+                ry1 = max(0, int(round(cy / snap_scale)))
+                rx2 = min(w, int(round((cx + cw) / snap_scale)))
+                ry2 = min(h, int(round((cy + ch) / snap_scale)))
 
-            if ry1 < int(0.08 * h) and (rx2 - rx1) / max(1, ry2 - ry1) > 3.2:
-                continue
-            if any(overlap_ratio((rx1, ry1, rx2, ry2), c[:4]) > 0.20 for c in candidates):
-                continue
+                if ry1 < int(0.08 * h) and (rx2 - rx1) / max(1, ry2 - ry1) > 3.2:
+                    continue
+                if any(overlap_ratio((rx1, ry1, rx2, ry2), c[:4]) > 0.20 for c in candidates):
+                    continue
 
-            candidates.append((rx1, ry1, rx2, ry2, 0.72))
+                candidates.append((rx1, ry1, rx2, ry2, self.conf))
 
         detections = []
         for x1, y1, x2, y2, conf in candidates:
@@ -610,7 +650,7 @@ def run_extraction_pipeline(
 
 @st.cache_resource
 def load_detector(weights_path: str) -> YOLOAdDetector:
-    return YOLOAdDetector(weights_path=weights_path, conf=0.50, imgsz=1024)
+    return YOLOAdDetector(weights_path=weights_path, conf=0.70, imgsz=1024)
 
 
 st.set_page_config(page_title="Newspaper Ad Cropper", layout="wide")
@@ -630,13 +670,19 @@ with st.sidebar:
         "Confidence threshold",
         min_value=0.10,
         max_value=0.95,
-        value=0.50,
+        value=0.70,
         step=0.05,
-        help="Minimum confidence required to keep a detected ad (0.50 is tuned for bilingual_v2).",
+        help="Minimum confidence required to keep a detected ad (0.70 recommended).",
     )
-    st.caption("Adjust the threshold, then click Submit on your upload.")
+    recover_solid_ads = st.checkbox(
+        "Recover solid-color sidebar ads",
+        value=True,
+        help="Catches smooth solid/gradient display ads (such as sidebar product banners) while ignoring textured news photos.",
+    )
+    st.caption("Adjust settings, then click Submit on your upload.")
 
 detector.conf = conf_threshold
+detector.recover_solid_ads = recover_solid_ads
 
 # --- Two Separate Upload & Submit Sections ---
 col_single, col_bulk = st.columns(2)
