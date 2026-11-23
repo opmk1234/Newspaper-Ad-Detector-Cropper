@@ -1,14 +1,24 @@
+import os
+
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import csv
 import gc
 import io
 import itertools
+import tempfile
 import zipfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 import streamlit as st
+import torch
 from ultralytics import YOLO
+
+torch.set_num_threads(1)
 
 VALID_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -19,6 +29,18 @@ def resolve_weights_path() -> Path | None:
         if candidate.exists():
             return candidate
     return None
+
+
+def cap_image_resolution(img_bgr: np.ndarray, max_dim: int = 2400) -> np.ndarray:
+    """Cap oversized broadsheets to 2400px on the longest edge to prevent RAM spikes."""
+    h, w = img_bgr.shape[:2]
+    longest = max(h, w)
+    if longest <= max_dim:
+        return img_bgr
+    scale = max_dim / float(longest)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    return cv2.resize(img_bgr, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 def trim_mirror_padding(img_bgr: np.ndarray, mae_thresh: float = 9.5) -> np.ndarray:
@@ -78,7 +100,7 @@ def trim_mirror_padding(img_bgr: np.ndarray, mae_thresh: float = 9.5) -> np.ndar
 
 
 def estimate_paper_color(img_bgr: np.ndarray) -> np.ndarray:
-    """Estimate the blank newsprint background color from outer page margins."""
+    """Estimate the blank newsprint background color as a 3-element uint8 BGR array."""
     h, w = img_bgr.shape[:2]
     my = max(4, int(0.015 * h))
     mx = max(4, int(0.015 * w))
@@ -91,7 +113,7 @@ def estimate_paper_color(img_bgr: np.ndarray) -> np.ndarray:
         ],
         axis=0,
     )
-    return np.median(border_pixels, axis=0).astype(np.float32)
+    return np.median(border_pixels, axis=0).astype(np.uint8)
 
 
 def overlap_ratio(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
@@ -111,7 +133,7 @@ def overlap_ratio(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, 
 def snap_outward_to_border(
     work_bgr: np.ndarray,
     work_gray: np.ndarray,
-    paper_bgr: np.ndarray,
+    paper_u8: np.ndarray,
     box: tuple[int, int, int, int],
     max_scan_ratio: float = 0.02,
 ) -> tuple[int, int, int, int]:
@@ -125,7 +147,7 @@ def snap_outward_to_border(
     sx2, sy2 = min(w, bx2 + scan_x), min(h, by2 + scan_y)
 
     roi_gray = work_gray[sy1:sy2, sx1:sx2]
-    roi_bgr = work_bgr[sy1:sy2, sx1:sx2].astype(np.float32)
+    roi_bgr = work_bgr[sy1:sy2, sx1:sx2]
     if roi_gray.size == 0:
         return bx1, by1, bx2, by2
 
@@ -136,8 +158,9 @@ def snap_outward_to_border(
     )
     ink_mask = cv2.bitwise_or(otsu, adapt) > 0
 
-    color_diff = np.linalg.norm(roi_bgr - paper_bgr, axis=2)
-    fg_mask = np.logical_or(ink_mask, color_diff > 22.0)
+    paper_patch = np.broadcast_to(paper_u8, roi_bgr.shape)
+    color_diff = cv2.absdiff(roi_bgr, paper_patch).sum(axis=2)
+    fg_mask = np.logical_or(ink_mask, color_diff > 38)
 
     rx1, ry1 = bx1 - sx1, by1 - sy1
     rx2, ry2 = bx2 - sx1, by2 - sy1
@@ -185,22 +208,26 @@ def snap_outward_to_border(
 
 def trim_exact_ad_edges(
     img_bgr: np.ndarray,
-    paper_bgr: np.ndarray,
+    paper_u8: np.ndarray,
     box: tuple[int, int, int, int],
 ) -> tuple[int, int, int, int]:
     """
     Trim any overshot editorial text across a clean white separator gutter and strip
-    outer blank newsprint margins on all 4 sides so zero extra padding remains.
+    outer blank newsprint margins on all 4 sides using low-RAM uint8 operations.
     """
     fx1, fy1, fx2, fy2 = box
-    crop_bgr = img_bgr[fy1:fy2, fx1:fx2].astype(np.float32)
+    crop_bgr = img_bgr[fy1:fy2, fx1:fx2]
     bh, bw = crop_bgr.shape[:2]
     if bh < 30 or bw < 30:
         return box
 
+    def row_col_fg(sub_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        diff = cv2.absdiff(sub_bgr, np.broadcast_to(paper_u8, sub_bgr.shape))
+        fg = diff.sum(axis=2) > 31
+        return fg.mean(axis=1), fg.mean(axis=0)
+
     # 1. Trim overshot top editorial text across a white separator gutter (within top 10%)
-    fg = np.linalg.norm(crop_bgr - paper_bgr, axis=2) > 18.0
-    row_fg = fg.mean(axis=1)
+    row_fg, _ = row_col_fg(crop_bgr)
     max_trim_y = int(0.10 * bh)
     blank_top = np.where(row_fg[:max_trim_y] < 0.02)[0]
     if len(blank_top) >= 3:
@@ -213,10 +240,9 @@ def trim_exact_ad_edges(
                 fy1 += last_blank + 1
 
     # 2. Trim overshot bottom editorial text across a white separator gutter (within bottom 10%)
-    crop_bgr = img_bgr[fy1:fy2, fx1:fx2].astype(np.float32)
+    crop_bgr = img_bgr[fy1:fy2, fx1:fx2]
     bh, bw = crop_bgr.shape[:2]
-    fg = np.linalg.norm(crop_bgr - paper_bgr, axis=2) > 18.0
-    row_fg = fg.mean(axis=1)
+    row_fg, _ = row_col_fg(crop_bgr)
     max_trim_y = int(0.10 * bh)
     blank_bot = np.where(row_fg[bh - max_trim_y :] < 0.02)[0]
     if len(blank_bot) >= 3:
@@ -229,10 +255,8 @@ def trim_exact_ad_edges(
                 fy2 = fy1 + first_blank
 
     # 3. Strip outer blank paper rows/columns on all 4 edges (0 px extra padding)
-    crop_bgr = img_bgr[fy1:fy2, fx1:fx2].astype(np.float32)
-    fg = np.linalg.norm(crop_bgr - paper_bgr, axis=2) > 18.0
-    row_fg = fg.mean(axis=1)
-    col_fg = fg.mean(axis=0)
+    crop_bgr = img_bgr[fy1:fy2, fx1:fx2]
+    row_fg, col_fg = row_col_fg(crop_bgr)
 
     while fy1 < fy2 - 20 and row_fg[0] < 0.015:
         fy1 += 1
@@ -271,7 +295,6 @@ def extend_to_footer_rule(
     if strip.size == 0:
         return box
 
-    # Detect thin dark OR light-gray horizontal rules via horizontal line continuity
     line_mask = (strip < 228).astype(np.uint8)
     closed_h = cv2.morphologyEx(line_mask, cv2.MORPH_CLOSE, np.ones((1, 5), dtype=np.uint8))
 
@@ -309,7 +332,7 @@ def extend_to_footer_rule(
 
 def is_uniform_solid_ad_block(
     work_bgr: np.ndarray,
-    paper_bgr: np.ndarray,
+    paper_u8: np.ndarray,
     cx: int,
     cy: int,
     cw: int,
@@ -333,10 +356,9 @@ def is_uniform_solid_ad_block(
         return False
 
     roi_bgr = work_bgr[cy : cy + ch, cx : cx + cw]
-    # Downsample large candidate blocks before float32 texture checks to save RAM
     max_roi_dim = max(cw, ch)
-    if max_roi_dim > 360:
-        s = 360.0 / max_roi_dim
+    if max_roi_dim > 320:
+        s = 320.0 / max_roi_dim
         roi_bgr = cv2.resize(
             roi_bgr,
             (max(1, int(round(cw * s))), max(1, int(round(ch * s)))),
@@ -344,27 +366,25 @@ def is_uniform_solid_ad_block(
         )
 
     rh, rw = roi_bgr.shape[:2]
-    roi_f = roi_bgr.astype(np.float32)
-    blur_f = cv2.blur(roi_f, (3, 3))
-    local_diff = np.linalg.norm(roi_f - blur_f, axis=2)
+    blur_u8 = cv2.blur(roi_bgr, (3, 3))
+    local_diff = cv2.absdiff(roi_bgr, blur_u8).sum(axis=2)
 
     roi_hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
-    color_dist = np.linalg.norm(roi_f - paper_bgr, axis=2)
+    color_dist = cv2.absdiff(roi_bgr, np.broadcast_to(paper_u8, roi_bgr.shape)).sum(axis=2)
 
-    # Smooth tinted pixels exclude high-texture photographic foliage/faces/rubble
-    smooth_tinted = (local_diff <= 6.0) & (roi_hsv[:, :, 1] >= 15) & (color_dist >= 16.0)
+    smooth_tinted = (local_diff <= 10) & (roi_hsv[:, :, 1] >= 15) & (color_dist >= 28)
     smooth_pixels = roi_bgr[smooth_tinted]
     if smooth_pixels.shape[0] < int(0.36 * rw * rh):
         return False
 
-    # Check that smooth pixels belong to one dominant background fill/gradient
     quant = (smooth_pixels // 20).astype(np.int32)
     keys = quant[:, 0] * 169 + quant[:, 1] * 13 + quant[:, 2]
     vals, counts = np.unique(keys, return_counts=True)
     top_key = vals[int(np.argmax(counts))]
-    mode_bgr = np.median(smooth_pixels[keys == top_key], axis=0).astype(np.float32)
+    mode_u8 = np.median(smooth_pixels[keys == top_key], axis=0).astype(np.uint8)
 
-    consistent_ratio = float((smooth_tinted & (np.linalg.norm(roi_f - mode_bgr, axis=2) <= 34.0)).mean())
+    mode_dist = cv2.absdiff(roi_bgr, np.broadcast_to(mode_u8, roi_bgr.shape)).sum(axis=2)
+    consistent_ratio = float((smooth_tinted & (mode_dist <= 58)).mean())
     return consistent_ratio >= 0.34
 
 
@@ -384,17 +404,17 @@ class YOLOAdDetector:
     def detect(self, image_bgr: np.ndarray) -> list[dict]:
         h, w = image_bgr.shape[:2]
 
-        # Strictly respect the user's confidence slider for all YOLO detections
-        res = self.model.predict(
-            source=image_bgr,
-            imgsz=self.imgsz,
-            conf=self.conf,
-            iou=0.45,
-            agnostic_nms=True,
-            verbose=False,
-        )[0]
+        with torch.inference_mode():
+            res = self.model.predict(
+                source=image_bgr,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                iou=0.45,
+                agnostic_nms=True,
+                verbose=False,
+            )[0]
 
-        snap_scale = min(1.0, 1600.0 / max(h, w))
+        snap_scale = min(1.0, 1400.0 / max(h, w))
         if snap_scale < 1.0:
             sw = max(1, int(round(w * snap_scale)))
             sh = max(1, int(round(h * snap_scale)))
@@ -425,7 +445,6 @@ class YOLOAdDetector:
                 if bw < int(0.03 * w) or bh < int(0.02 * h):
                     continue
 
-                # Drop narrow vertical ribbons hugging the outer left/right edges
                 edge_margin = max(6, int(0.006 * w))
                 touches_lr_edge = (x1 <= edge_margin) or (x2 >= w - edge_margin)
                 if touches_lr_edge and bw < int(0.24 * w) and (bh / max(1, bw)) > 3.5:
@@ -433,15 +452,18 @@ class YOLOAdDetector:
 
                 candidates.append((x1, y1, x2, y2, conf))
 
-        # Smooth solid/pastel display-ad recovery (catches compact banners like USHA without triggering on photos)
+        del res
+
         if self.recover_solid_ads:
-            color_dist = np.linalg.norm(work_bgr.astype(np.float32) - paper_work, axis=2)
+            color_dist = cv2.absdiff(work_bgr, np.broadcast_to(paper_work, work_bgr.shape)).sum(axis=2)
             sat = cv2.cvtColor(work_bgr, cv2.COLOR_BGR2HSV)[:, :, 1]
-            color_mask = ((color_dist > 16.0) & (sat > 15)).astype(np.uint8) * 255
+            color_mask = ((color_dist > 28) & (sat > 15)).astype(np.uint8) * 255
+            del color_dist, sat
             color_mask = cv2.morphologyEx(
                 color_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
             )
             num_lbls, _, stats, _ = cv2.connectedComponentsWithStats(color_mask, connectivity=8)
+            del color_mask
 
             for lbl in range(1, num_lbls):
                 cx, cy, cw, ch, area = map(int, stats[lbl])
@@ -470,7 +492,7 @@ class YOLOAdDetector:
             sx1, sy1, sx2, sy2 = snap_outward_to_border(
                 work_bgr=work_bgr,
                 work_gray=work_gray,
-                paper_bgr=paper_work,
+                paper_u8=paper_work,
                 box=(wx1, wy1, wx2, wy2),
             )
 
@@ -487,7 +509,10 @@ class YOLOAdDetector:
                 "confidence": round(conf, 4),
             })
 
-        # Merge horizontally overlapping boxes that share the same vertical band
+        del work_gray, full_gray
+        if snap_scale < 1.0:
+            del work_bgr
+
         merged: list[dict] = []
         for det in sorted(detections, key=lambda d: d["bbox"][0]):
             cx1, cy1, cx2, cy2 = det["bbox"]
@@ -510,8 +535,8 @@ class YOLOAdDetector:
         return merged
 
 
-def build_preview_jpeg(img_bgr: np.ndarray, detections: list[dict], max_dim: int = 1200) -> bytes:
-    """Create a lightweight JPEG preview of the page with green bounding boxes."""
+def build_preview_jpeg(img_bgr: np.ndarray, detections: list[dict], max_dim: int = 960) -> bytes:
+    """Create a compact JPEG preview of the page with green bounding boxes."""
     h, w = img_bgr.shape[:2]
     scale = min(1.0, max_dim / max(h, w))
     if scale < 1.0:
@@ -532,18 +557,17 @@ def build_preview_jpeg(img_bgr: np.ndarray, detections: list[dict], max_dim: int
             f"ad #{ad_idx} ({conf:.2f})",
             (x1, max(20, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
+            0.55,
             (0, 200, 0),
             2,
         )
 
-    _, buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    _, buf = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 78])
     return buf.tobytes()
 
 
-def unpack_uploaded_images(uploaded_files) -> list[tuple[str, str, bytes]]:
-    """Extract individual images from direct uploads and .zip archives."""
-    items: list[tuple[str, str, bytes]] = []
+def iter_uploaded_images(uploaded_files):
+    """Stream individual images one by one without holding a whole ZIP batch in RAM."""
     seen_stems: dict[str, int] = {}
 
     def unique_stem(raw_name: str) -> str:
@@ -553,25 +577,50 @@ def unpack_uploaded_images(uploaded_files) -> list[tuple[str, str, bytes]]:
         return base if count == 1 else f"{base}_{count}"
 
     for uf in uploaded_files:
-        raw = uf.getvalue()
         suffix = Path(uf.name).suffix.lower()
-
         if suffix == ".zip":
-            with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+            with zipfile.ZipFile(io.BytesIO(uf.getvalue()), "r") as zf:
                 for member in sorted(zf.namelist()):
                     p = Path(member)
                     if member.endswith("/") or "__MACOSX" in p.parts or p.name.startswith("."):
                         continue
                     if p.suffix.lower() in VALID_EXTS:
-                        items.append((p.name, unique_stem(p.name), zf.read(member)))
+                        yield (p.name, unique_stem(p.name), zf.read(member))
         elif suffix in VALID_EXTS:
-            items.append((uf.name, unique_stem(uf.name), raw))
+            yield (uf.name, unique_stem(uf.name), uf.getvalue())
 
-    return items
+
+def count_uploaded_images(uploaded_files) -> int:
+    """Count total valid images without decoding or storing them."""
+    total = 0
+    for uf in uploaded_files:
+        suffix = Path(uf.name).suffix.lower()
+        if suffix == ".zip":
+            with zipfile.ZipFile(io.BytesIO(uf.getvalue()), "r") as zf:
+                for member in zf.namelist():
+                    p = Path(member)
+                    if not member.endswith("/") and "__MACOSX" not in p.parts and not p.name.startswith("."):
+                        if p.suffix.lower() in VALID_EXTS:
+                            total += 1
+        elif suffix in VALID_EXTS:
+            total += 1
+    return total
+
+
+def cleanup_previous_run() -> None:
+    """Delete previous temp ZIP file and free session memory before a new run."""
+    old = st.session_state.pop("last_run", None)
+    if isinstance(old, dict) and old.get("zip_path"):
+        try:
+            Path(old["zip_path"]).unlink(missing_ok=True)
+        except OSError:
+            pass
+    gc.collect()
 
 
 def run_extraction_pipeline(
-    image_items: list[tuple[str, str, bytes]],
+    uploaded_files,
+    total_items: int,
     detector: YOLOAdDetector,
     organize_by_folder: bool = False,
     show_progress: bool = False,
@@ -579,24 +628,28 @@ def run_extraction_pipeline(
     progress = st.progress(0, text="Starting ad detection...") if show_progress else None
     pages_data = []
     manifest_rows = []
-    zip_buffer = io.BytesIO()
     total_ads = 0
     pages_with_ads = 0
 
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as master_zip:
-        for idx, (display_name, stem, img_bytes) in enumerate(image_items):
+    tmp_zip = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    zip_path = tmp_zip.name
+    tmp_zip.close()
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as master_zip:
+        for idx, (display_name, stem, img_bytes) in enumerate(iter_uploaded_images(uploaded_files)):
             if progress is not None:
                 progress.progress(
-                    idx / len(image_items),
-                    text=f"Processing {idx + 1}/{len(image_items)}: {display_name}",
+                    idx / max(1, total_items),
+                    text=f"Processing {idx + 1}/{total_items}: {display_name}",
                 )
 
             arr = np.frombuffer(img_bytes, dtype=np.uint8)
             img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            del arr
+            del arr, img_bytes
             if img_bgr is None:
                 continue
 
+            img_bgr = cap_image_resolution(img_bgr, max_dim=2400)
             img_bgr = trim_mirror_padding(img_bgr)
             detections = detector.detect(img_bgr)
             page_crops = []
@@ -616,7 +669,6 @@ def run_extraction_pipeline(
                     zip_member_path = f"{stem}/{crop_filename}" if organize_by_folder else crop_filename
                     master_zip.writestr(zip_member_path, png_buf.tobytes())
 
-                    # Store zip_path instead of duplicating PNG bytes in session_state
                     page_crops.append({
                         "id": ad_idx,
                         "confidence": conf,
@@ -658,7 +710,7 @@ def run_extraction_pipeline(
 
     return {
         "pages": pages_data,
-        "zip_bytes": zip_buffer.getvalue(),
+        "zip_path": zip_path,
         "total_pages": len(pages_data),
         "pages_with_ads": pages_with_ads,
         "total_ads": total_ads,
@@ -743,30 +795,29 @@ with col_bulk:
         )
 
 if submit_single and single_file is not None:
-    items = unpack_uploaded_images([single_file])
-    if not items:
+    cleanup_previous_run()
+    total = count_uploaded_images([single_file])
+    if total == 0:
         st.error("Could not read the uploaded image.")
     else:
         with st.spinner(f"Detecting ads on {single_file.name}..."):
-            res = run_extraction_pipeline(items, detector, organize_by_folder=False, show_progress=False)
-        del items
-        gc.collect()
+            res = run_extraction_pipeline([single_file], total, detector, organize_by_folder=False, show_progress=False)
         res["mode"] = "single"
         st.session_state["last_run"] = res
 
 if submit_bulk and bulk_files:
-    items = unpack_uploaded_images(bulk_files)
-    if not items:
+    cleanup_previous_run()
+    total = count_uploaded_images(bulk_files)
+    if total == 0:
         st.error("No valid image files found in the bulk upload.")
     else:
         res = run_extraction_pipeline(
-            items,
+            bulk_files,
+            total,
             detector,
             organize_by_folder=organize_by_folder,
             show_progress=True,
         )
-        del items
-        gc.collect()
         res["mode"] = "bulk"
         st.session_state["last_run"] = res
 
@@ -776,8 +827,9 @@ if "last_run" not in st.session_state:
 
 results = st.session_state["last_run"]
 pages = results["pages"]
+zip_file_path = Path(results["zip_path"])
 
-if not pages:
+if not pages or not zip_file_path.exists():
     st.error("No readable pages were processed.")
     st.stop()
 
@@ -792,7 +844,7 @@ if results["mode"] == "single":
         st.success(f"Detected {ad_count} ad(s) on **{active_page['display_name']}**.")
         st.download_button(
             label=f"Download All {ad_count} Crops (.zip)",
-            data=results["zip_bytes"],
+            data=zip_file_path.read_bytes(),
             file_name=f"{active_page['stem']}_ads.zip",
             mime="application/zip",
             type="primary",
@@ -809,7 +861,7 @@ else:
     if results["total_ads"] > 0:
         st.download_button(
             label=f"Download All {results['total_ads']} Crops + summary.csv (.zip)",
-            data=results["zip_bytes"],
+            data=zip_file_path.read_bytes(),
             file_name="extracted_newspaper_ads.zip",
             mime="application/zip",
             type="primary",
@@ -848,7 +900,7 @@ with col_crops:
     if not active_page["crops"]:
         st.info("No ads detected on this page.")
     else:
-        with zipfile.ZipFile(io.BytesIO(results["zip_bytes"]), "r") as zf:
+        with zipfile.ZipFile(zip_file_path, "r") as zf:
             for crop in active_page["crops"]:
                 crop_png = zf.read(crop["zip_path"])
                 w_px = crop["bbox"][2] - crop["bbox"][0]
