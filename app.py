@@ -100,7 +100,7 @@ def trim_mirror_padding(img_bgr: np.ndarray, mae_thresh: float = 9.5) -> np.ndar
 
 
 def estimate_paper_color(img_bgr: np.ndarray) -> np.ndarray:
-    """Estimate the blank newsprint background color as a 3-element uint8 BGR array."""
+    """Estimate the light newsprint background color even on full-bleed dark-edged pages."""
     h, w = img_bgr.shape[:2]
     my = max(4, int(0.015 * h))
     mx = max(4, int(0.015 * w))
@@ -113,7 +113,12 @@ def estimate_paper_color(img_bgr: np.ndarray) -> np.ndarray:
         ],
         axis=0,
     )
-    return np.median(border_pixels, axis=0).astype(np.uint8)
+    luma = border_pixels.sum(axis=1)
+    bright_thresh = np.percentile(luma, 75)
+    light_pixels = border_pixels[luma >= bright_thresh]
+    if light_pixels.size == 0:
+        light_pixels = border_pixels
+    return np.median(light_pixels, axis=0).astype(np.uint8)
 
 
 def overlap_ratio(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, int]) -> float:
@@ -137,14 +142,23 @@ def snap_outward_to_border(
     box: tuple[int, int, int, int],
     max_scan_ratio: float = 0.02,
 ) -> tuple[int, int, int, int]:
-    """Expand a slightly tight YOLO box outward to the nearest enclosing border rule (0 px extra padding)."""
+    """Expand a slightly tight YOLO box outward to the nearest enclosing border or corner header."""
     h, w = work_gray.shape
     bx1, by1, bx2, by2 = box
 
+    # Only use extended upward corner scan for large top-of-page display ads (e.g. full-page posters)
+    is_large_top_ad = (
+        (by1 < int(0.20 * h))
+        and ((by2 - by1) > int(0.45 * h))
+        and ((bx2 - bx1) > int(0.65 * w))
+    )
+    top_scan_ratio = 0.12 if is_large_top_ad else max_scan_ratio
+
     scan_x = max(8, int(w * max_scan_ratio))
-    scan_y = max(8, int(h * max_scan_ratio))
-    sx1, sy1 = max(0, bx1 - scan_x), max(0, by1 - scan_y)
-    sx2, sy2 = min(w, bx2 + scan_x), min(h, by2 + scan_y)
+    scan_y_top = max(8, int(h * top_scan_ratio))
+    scan_y_bot = max(8, int(h * max_scan_ratio))
+    sx1, sy1 = max(0, bx1 - scan_x), max(0, by1 - scan_y_top)
+    sx2, sy2 = min(w, bx2 + scan_x), min(h, by2 + scan_y_bot)
 
     roi_gray = work_gray[sy1:sy2, sx1:sx2]
     roi_bgr = work_bgr[sy1:sy2, sx1:sx2]
@@ -165,37 +179,67 @@ def snap_outward_to_border(
     rx1, ry1 = bx1 - sx1, by1 - sy1
     rx2, ry2 = bx2 - sx1, by2 - sy1
     gutter_stop_px = max(4, int(0.004 * min(w, h)))
+    corner_gap_stop_px = max(24, int(0.028 * h))
 
-    def scan_side(strip_ink: np.ndarray, strip_fg: np.ndarray, reverse: bool) -> int:
+    def scan_side(
+        strip_ink: np.ndarray,
+        strip_fg: np.ndarray,
+        reverse: bool,
+        min_fg: float = 0.025,
+        allow_corner_bridge: bool = False,
+    ) -> int:
         length = strip_ink.shape[0]
         if length == 0:
             return 0
 
         ink_density = strip_ink.mean(axis=1)
         fg_density = strip_fg.mean(axis=1)
+        sw_strip = strip_fg.shape[1]
+        mid_fg = strip_fg[:, int(0.28 * sw_strip) : int(0.72 * sw_strip)].mean(axis=1)
+        left_fg = strip_fg[:, : max(1, int(0.22 * sw_strip))].mean(axis=1)
+        right_fg = strip_fg[:, min(sw_strip - 1, int(0.78 * sw_strip)) :].mean(axis=1)
+
         if reverse:
             ink_density = ink_density[::-1]
             fg_density = fg_density[::-1]
+            mid_fg = mid_fg[::-1]
+            left_fg = left_fg[::-1]
+            right_fg = right_fg[::-1]
 
-        border_hits = np.where((ink_density > 0.60) | (fg_density > 0.70))[0]
-        if len(border_hits) > 0:
-            return int(border_hits.min()) + 1
+        ink_hits = np.where(ink_density > 0.55)[0]
+        if len(ink_hits) > 0:
+            return int(ink_hits.min()) + 1
+
+        if fg_density[0] < 0.35:
+            color_hits = np.where(fg_density > 0.70)[0]
+            if len(color_hits) > 0:
+                return int(color_hits.min()) + 1
 
         best_offset = 0
         empty_run = 0
         for idx, d in enumerate(fg_density):
-            if d > 0.025:
+            has_corner_obj = allow_corner_bridge and (left_fg[idx] > 0.03 or right_fg[idx] > 0.03)
+            if d > min_fg or has_corner_obj:
+                if allow_corner_bridge and empty_run >= gutter_stop_px and mid_fg[idx] >= 0.02:
+                    break
                 best_offset = idx + 1
                 empty_run = 0
             else:
                 empty_run += 1
-                if empty_run >= gutter_stop_px:
+                stop_limit = corner_gap_stop_px if allow_corner_bridge else gutter_stop_px
+                if empty_run >= stop_limit:
                     break
         return best_offset
 
     left_ext = scan_side(ink_mask[ry1:ry2, :rx1].T, fg_mask[ry1:ry2, :rx1].T, reverse=True)
     right_ext = scan_side(ink_mask[ry1:ry2, rx2:].T, fg_mask[ry1:ry2, rx2:].T, reverse=False)
-    top_ext = scan_side(ink_mask[:ry1, rx1:rx2], fg_mask[:ry1, rx1:rx2], reverse=True)
+    top_ext = scan_side(
+        ink_mask[:ry1, rx1:rx2],
+        fg_mask[:ry1, rx1:rx2],
+        reverse=True,
+        min_fg=0.012 if is_large_top_ad else 0.025,
+        allow_corner_bridge=is_large_top_ad,
+    )
     bottom_ext = scan_side(ink_mask[ry2:, rx1:rx2], fg_mask[ry2:, rx1:rx2], reverse=False)
 
     fx1 = max(0, bx1 - left_ext)
@@ -213,7 +257,7 @@ def trim_exact_ad_edges(
 ) -> tuple[int, int, int, int]:
     """
     Trim any overshot editorial text across a clean white separator gutter and strip
-    outer blank newsprint margins on all 4 sides using low-RAM uint8 operations.
+    outer blank newsprint margins on all 4 sides without clipping narrow corner logos.
     """
     fx1, fy1, fx2, fy2 = box
     crop_bgr = img_bgr[fy1:fy2, fx1:fx2]
@@ -221,20 +265,22 @@ def trim_exact_ad_edges(
     if bh < 30 or bw < 30:
         return box
 
-    def row_col_fg(sub_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def compute_fg(sub_bgr: np.ndarray) -> np.ndarray:
         diff = cv2.absdiff(sub_bgr, np.broadcast_to(paper_u8, sub_bgr.shape))
-        fg = diff.sum(axis=2) > 31
-        return fg.mean(axis=1), fg.mean(axis=0)
+        return diff.sum(axis=2) > 31
 
     # 1. Trim overshot top editorial text across a white separator gutter (within top 10%)
-    row_fg, _ = row_col_fg(crop_bgr)
+    fg = compute_fg(crop_bgr)
+    row_fg = fg.mean(axis=1)
     max_trim_y = int(0.10 * bh)
     blank_top = np.where(row_fg[:max_trim_y] < 0.02)[0]
     if len(blank_top) >= 3:
         last_blank = int(blank_top[-1])
         if last_blank + 3 < bh and row_fg[last_blank + 1 : last_blank + 4].mean() > 0.30:
             above = row_fg[:last_blank]
-            has_editorial = np.any((above > 0.04) & (above < 0.78))
+            mid_above = float(fg[:last_blank, int(0.28 * bw) : int(0.72 * bw)].mean()) if last_blank > 0 else 0.0
+            is_corner_logo_band = (last_blank > 0) and (mid_above < 0.015)
+            has_editorial = np.any((above > 0.04) & (above < 0.78)) and not is_corner_logo_band
             all_blank = np.all(above < 0.02) if len(above) > 0 else True
             if all_blank or has_editorial:
                 fy1 += last_blank + 1
@@ -242,7 +288,8 @@ def trim_exact_ad_edges(
     # 2. Trim overshot bottom editorial text across a white separator gutter (within bottom 10%)
     crop_bgr = img_bgr[fy1:fy2, fx1:fx2]
     bh, bw = crop_bgr.shape[:2]
-    row_fg, _ = row_col_fg(crop_bgr)
+    fg = compute_fg(crop_bgr)
+    row_fg = fg.mean(axis=1)
     max_trim_y = int(0.10 * bh)
     blank_bot = np.where(row_fg[bh - max_trim_y :] < 0.02)[0]
     if len(blank_bot) >= 3:
@@ -254,16 +301,24 @@ def trim_exact_ad_edges(
             if all_blank or has_editorial:
                 fy2 = fy1 + first_blank
 
-    # 3. Strip outer blank paper rows/columns on all 4 edges (0 px extra padding)
+    # 3. Strip outer blank paper rows/columns on all 4 edges while preserving corner logos/QR codes
     crop_bgr = img_bgr[fy1:fy2, fx1:fx2]
-    row_fg, col_fg = row_col_fg(crop_bgr)
+    fg = compute_fg(crop_bgr)
+    row_fg = fg.mean(axis=1)
+    col_fg = fg.mean(axis=0)
+    left_c = fg[:, : max(1, int(0.22 * bw))].mean(axis=1)
+    right_c = fg[:, min(bw - 1, int(0.78 * bw)) :].mean(axis=1)
 
-    while fy1 < fy2 - 20 and row_fg[0] < 0.015:
+    while fy1 < fy2 - 20 and row_fg[0] < 0.004 and left_c[0] < 0.02 and right_c[0] < 0.02:
         fy1 += 1
         row_fg = row_fg[1:]
-    while fy2 > fy1 + 20 and row_fg[-1] < 0.015:
+        left_c = left_c[1:]
+        right_c = right_c[1:]
+    while fy2 > fy1 + 20 and row_fg[-1] < 0.004 and left_c[-1] < 0.02 and right_c[-1] < 0.02:
         fy2 -= 1
         row_fg = row_fg[:-1]
+        left_c = left_c[:-1]
+        right_c = right_c[:-1]
     while fx1 < fx2 - 20 and col_fg[0] < 0.015:
         fx1 += 1
         col_fg = col_fg[1:]
@@ -768,7 +823,7 @@ with col_single:
         submit_single = st.button(
             "Submit Single Image",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=(single_file is None),
             key="submit_single",
         )
@@ -789,7 +844,7 @@ with col_bulk:
         submit_bulk = st.button(
             "Submit Bulk Files",
             type="primary",
-            use_container_width=True,
+            width="stretch",
             disabled=(not bulk_files),
             key="submit_bulk",
         )
@@ -893,7 +948,7 @@ col_page, col_crops = st.columns([1.2, 1])
 
 with col_page:
     st.subheader(f"Page: {active_page['display_name']}")
-    st.image(active_page["preview_bytes"], use_container_width=True)
+    st.image(active_page["preview_bytes"], width="stretch")
 
 with col_crops:
     st.subheader(f"Extracted Ads ({len(active_page['crops'])})")
@@ -908,7 +963,7 @@ with col_crops:
                 st.image(
                     crop_png,
                     caption=f"Ad #{crop['id']} — conf {crop['confidence']:.2f} ({w_px}×{h_px} px)",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 st.download_button(
                     label=f"Download {crop['filename']}",
